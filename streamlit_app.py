@@ -1,164 +1,147 @@
-# app_streamlit.py
-# App Streamlit para deploy de modelos estatísticos (SARIMA/Prophet) e IA (LSTM)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os
-import tempfile
+import joblib
+import pickle
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
 
-st.set_page_config(page_title="Previsão", layout="wide")
-
-st.title("📈 App de Previsão — SARIMA / Prophet / LSTM")
-
-# ----------------------------- Helpers -----------------------------
-@st.cache_resource
-def load_joblib_model(path):
-    import joblib
-    return joblib.load(path)
-
-@st.cache_resource
-def load_keras_model(path):
-    from tensorflow.keras.models import load_model
-    return load_model(path)
-
-def save_uploaded_file(uploaded_file):
-    tmpdir = tempfile.mkdtemp()
-    path = os.path.join(tmpdir, uploaded_file.name)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return path
-
-def preprocess_for_stat_model(df):
-    """Garante índice datetime e série numérica"""
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-            df.set_index(df.columns[0], inplace=True)
-        except Exception:
-            pass
-    return df
-
-def preprocess_for_lstm(df, n_steps=12):
-    """Transforma série em janelas de entrada (não aplica scaler ainda)"""
-    values = df.values.astype("float32")
-    X = []
-    for i in range(len(values) - n_steps + 1):
-        X.append(values[i:i + n_steps])
-    X = np.array(X)
-    return X
-
-# ----------------------------- UI: Sidebar -----------------------------
-with st.sidebar:
-    st.header("Configuração")
-    model_source = st.selectbox("Onde está o modelo?", [
-        "Upload", "No repositório", "URL / Cloud"
-    ])
-
-    uploaded_model = None
-    model_path = None
-    model_url = None
-
-    if model_source == "Upload":
-        uploaded_model = st.file_uploader("Carregar ficheiro do modelo (.pkl, .joblib, .h5)", 
-                                         type=["pkl", "joblib", "h5", "pickle"])
-    elif model_source == "No repositório":
-        model_path = st.text_input("Caminho local (ex: modelo.pkl)", value="modelo.pkl")
-    else:
-        model_url = st.text_input("URL directo (S3 / GDrive / HF Raw)")
-
-    model_type = st.selectbox("Tipo de modelo", [
-        "Auto", "SARIMA / ARIMA", "Prophet", "LSTM"
-    ])
-
-    forecast_horizon = st.number_input("Horizonte de previsão (passos)", min_value=1, value=12)
-
-# ----------------------------- Carregar modelo -----------------------------
-model = None
-detected_type = None
-
-if uploaded_model is not None:
-    model_file_path = save_uploaded_file(uploaded_model)
-    ext = os.path.splitext(uploaded_model.name)[1].lower()
-    if ext in [".pkl", ".joblib", ".pickle"]:
-        try:
-            model = load_joblib_model(model_file_path)
-            detected_type = "SARIMA/ARIMA"
-        except Exception as e:
-            st.error(f"Erro ao carregar modelo estatístico: {e}")
-    elif ext in [".h5", ".keras"]:
-        try:
-            model = load_keras_model(model_file_path)
-            detected_type = "LSTM"
-        except Exception as e:
-            st.error(f"Erro ao carregar modelo Keras: {e}")
-    else:
-        st.warning("Extensão não reconhecida.")
-
-elif model_path:
-    ext = os.path.splitext(model_path)[1].lower()
+# ======================
+# Funções utilitárias
+# ======================
+def load_uploaded_model(uploaded_file, model_type):
     try:
-        if ext in [".pkl", ".joblib", ".pickle"]:
-            model = load_joblib_model(model_path)
-            detected_type = "SARIMA/ARIMA"
-        elif ext in [".h5", ".keras"]:
-            model = load_keras_model(model_path)
-            detected_type = "LSTM"
+        if model_type == "Keras (LSTM)":
+            return load_model(uploaded_file, compile=False)
+        elif model_type == "Pickle":
+            return pickle.load(uploaded_file)
+        elif model_type == "Joblib":
+            return joblib.load(uploaded_file)
+        else:
+            st.error("Tipo de modelo não reconhecido.")
+            return None
     except Exception as e:
-        st.error(f"Erro ao carregar modelo local: {e}")
+        st.error(f"Erro ao carregar modelo: {e}")
+        return None
 
-elif model_url:
-    st.info("Ainda não implementado: carregar modelo a partir de URL.")
 
-# ----------------------------- Main -----------------------------
-st.markdown("---")
-st.header("Dados de entrada")
+def stat_forecast(model, df_proc, horizon):
+    """
+    Tenta gerar forecast para modelos estatísticos/Prophet
+    ou interpretar arrays (caso o ficheiro carregado seja apenas previsões).
+    """
+    # Prophet
+    if "prophet" in str(type(model)).lower():
+        future = model.make_future_dataframe(periods=int(horizon), freq="M")
+        forecast_df = model.predict(future)[["ds", "yhat"]].tail(int(horizon))
+        return forecast_df.set_index("ds")["yhat"]
 
-uploaded_data = st.file_uploader("Carregar ficheiro de dados (CSV/Excel)", type=["csv", "xlsx", "xls"])
+    # statsmodels SARIMA
+    if hasattr(model, "forecast"):
+        return pd.Series(model.forecast(steps=int(horizon)))
+    if hasattr(model, "get_forecast"):
+        pred_obj = model.get_forecast(steps=int(horizon))
+        if hasattr(pred_obj, "predicted_mean"):
+            return pd.Series(pred_obj.predicted_mean)
+    if hasattr(model, "predict") and callable(model.predict):
+        start = len(df_proc)
+        end = start + int(horizon) - 1
+        return pd.Series(model.predict(start=start, end=end))
+
+    # Se for array salvo por engano
+    if isinstance(model, np.ndarray):
+        arr = model
+        if arr.ndim == 1 and len(arr) >= int(horizon):
+            return pd.Series(arr[-int(horizon):])
+        if arr.ndim == 2 and arr.shape[0] >= int(horizon):
+            return pd.Series(arr[-int(horizon):, 0])
+        raise RuntimeError("Array não é válido como forecast.")
+
+    raise RuntimeError(f"Modelo não suportado: {type(model)}")
+
+
+def keras_forecast(model, df_proc, scaler, window_size, horizon):
+    """
+    Forecast com LSTM Keras já treinada.
+    """
+    data = df_proc.values.reshape(-1, 1)
+    scaled_data = scaler.transform(data)
+
+    # Cria sequência inicial (última janela)
+    last_window = scaled_data[-window_size:]
+    preds_scaled = []
+
+    for _ in range(int(horizon)):
+        X_input = last_window.reshape(1, window_size, 1)
+        pred = model.predict(X_input, verbose=0)
+        preds_scaled.append(pred[0][0])
+        last_window = np.append(last_window[1:], pred)[-window_size:]
+
+    preds = scaler.inverse_transform(np.array(preds_scaled).reshape(-1, 1))
+    return pd.Series(preds.flatten())
+
+
+# ======================
+# Streamlit UI
+# ======================
+st.title("📊 Forecasting App (SARIMA, Prophet, LSTM)")
+
+uploaded_data = st.file_uploader("📂 Carregar ficheiro Excel com a série temporal", type=["xlsx", "xls"])
+uploaded_model = st.file_uploader("📂 Carregar modelo treinado (.pkl, .joblib, .h5, .keras)", type=["pkl", "joblib", "h5", "keras"])
+
+model_type = st.selectbox("📌 Tipo de modelo:", ["Estatístico (ARIMA/SARIMA/Prophet)", "Keras (LSTM)"])
+forecast_horizon = st.number_input("⏩ Quantos períodos prever:", min_value=1, max_value=60, value=12)
 
 if uploaded_data is not None:
-    if uploaded_data.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_data)
+    df = pd.read_excel(uploaded_data)
+    st.write("Pré-visualização dos dados:")
+    st.write(df.head())
+    # Assumindo colunas "Data" e "y"
+    df["Data"] = pd.to_datetime(df.iloc[:, 0])
+    df = df.set_index("Data")
+    df_proc = df.iloc[:, 0]
+
+if uploaded_model is not None:
+    st.write(f"🔄 A carregar modelo ({model_type}) ...")
+    model = None
+    scaler = None
+
+    if model_type == "Keras (LSTM)":
+        model = load_uploaded_model(uploaded_model, "Keras (LSTM)")
+        scaler_file = st.file_uploader("📂 Carregar scaler usado no treino (.pkl)", type=["pkl"])
+        if scaler_file is not None:
+            scaler = joblib.load(scaler_file)
     else:
-        df = pd.read_excel(uploaded_data)
+        # Primeiro tenta pickle, depois joblib
+        try:
+            model = pickle.load(uploaded_model)
+        except Exception:
+            uploaded_model.seek(0)
+            try:
+                model = joblib.load(uploaded_model)
+            except Exception as e:
+                st.error(f"Erro ao carregar modelo: {e}")
 
-    st.write("Preview dos dados:", df.head())
-
-    df_proc = preprocess_for_stat_model(df.copy())
-
-    if model is None:
-        st.warning("Nenhum modelo carregado ainda.")
-    else:
-        st.success(f"Modelo carregado. Tipo detectado: {detected_type or model_type}")
+    if model is not None and uploaded_data is not None:
+        st.success("✅ Modelo carregado com sucesso!")
 
         try:
-            # ---------------- SARIMA / ARIMA ----------------
-            if detected_type == "SARIMA/ARIMA" or model_type == "SARIMA / ARIMA":
-                preds = model.forecast(steps=int(forecast_horizon))
-                preds = pd.Series(preds, name="prediction")
-                st.line_chart(preds)
-                st.download_button("Descarregar previsões (CSV)", preds.to_csv(index=False), file_name="previsoes_sarima.csv")
+            if model_type == "Estatístico (ARIMA/SARIMA/Prophet)":
+                preds_series = stat_forecast(model, df_proc, forecast_horizon)
+            elif model_type == "Keras (LSTM)":
+                if scaler is None:
+                    st.error("⚠️ Precisas carregar também o scaler usado no treino.")
+                else:
+                    preds_series = keras_forecast(model, df_proc, scaler, window_size=12, horizon=forecast_horizon)
 
-            # ---------------- Prophet ----------------
-            elif model_type == "Prophet" or "prophet" in str(type(model)).lower():
-                future = model.make_future_dataframe(periods=int(forecast_horizon), freq="M")
-                preds = model.predict(future)[["ds", "yhat"]].tail(int(forecast_horizon))
-                st.line_chart(preds.set_index("ds")["yhat"])
-                out = preds.rename(columns={"ds": "date", "yhat": "prediction"})
-                st.download_button("Descarregar previsões (CSV)", out.to_csv(index=False), file_name="previsoes_prophet.csv")
-
-            # ---------------- LSTM ----------------
-            elif detected_type == "LSTM" or model_type == "LSTM":
-                n_steps = st.number_input("Tamanho da janela (timesteps)", min_value=1, value=12)
-                X = preprocess_for_lstm(df_proc, n_steps=n_steps)
-                preds = model.predict(X)
-                preds = preds[-int(forecast_horizon):].flatten()
-                st.line_chart(preds)
-                out = pd.DataFrame({"prediction": preds})
-                st.download_button("Descarregar previsões (CSV)", out.to_csv(index=False), file_name="previsoes_lstm.csv")
-
+            # Se chegou aqui, plotar
+            if preds_series is not None:
+                st.line_chart(preds_series)
+                st.download_button("💾 Descarregar previsões (CSV)",
+                                   preds_series.reset_index().to_csv(index=False),
+                                   file_name="previsoes.csv")
         except Exception as e:
             st.error(f"Erro a gerar previsões: {e}")
-
-else:
-    st.info("Carregue um ficheiro CSV ou Excel para começar.")
+            st.write("Tipo do objeto carregado:", type(model))
+            if isinstance(model, np.ndarray):
+                st.write("Array shape:", model.shape)
