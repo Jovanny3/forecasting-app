@@ -6,3 +6,4 @@ tensorflow
 joblib
 openpyxl
 prophet
+ploty
