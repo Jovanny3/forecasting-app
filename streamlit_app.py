@@ -122,10 +122,17 @@ elif model_url:
 st.markdown("---")
 st.header("Dados de entrada")
 
-uploaded_data = st.file_uploader("Carregar ficheiro CSV com série temporal", type="csv")
+
+uploaded_data = st.file_uploader("Carregar ficheiro de série temporal", type=["csv", "xlsx", "xls"])
+
 
 if uploaded_data is not None:
-    df = pd.read_csv(uploaded_data)
+    
+    if uploaded_data.name.endswith(".csv"):
+        df = pd.read_csv(uploaded_data)
+    else:
+        df = pd.read_excel(uploaded_data)
+
     st.write("Preview dos dados:", df.head())
 
     df_proc = preprocess_for_stat_model(df.copy())
@@ -134,6 +141,8 @@ if uploaded_data is not None:
         st.warning("Nenhum modelo carregado ainda. Faça upload do ficheiro do modelo na barra lateral.")
     else:
         st.success(f"Modelo carregado. Tipo detectado: {detected_type}")
+
+        
 
         if detected_type == "Estatístico" or model_type == "Estatístico (ARIMA/SARIMA/Prophet)":
             try:
